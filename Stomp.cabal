@@ -1,5 +1,5 @@
 Name:                Stomp
-Version:             0.1
+Version:             0.1.1
 Description:         Stomp is a client library for communicating with message servers through the 
                      STOMP protocol (http://stomp.github.com/stomp-specification-1.1.html)
 License:             BSD3

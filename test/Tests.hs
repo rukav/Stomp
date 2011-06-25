@@ -20,6 +20,7 @@ tests = [
             , testCase "stomp" testStomp
             , testCase "disconnect" testDisconnect
             , testCase "send" testSend
+            , testCase "send'" testBatchSend
             , testCase "subscribe" testSubscribe
             , testCase "unsubscribe" testUnsubscribe
             , testCase "ack" testAck
@@ -31,6 +32,7 @@ tests = [
             [ testCase "receipt" testReceipt
             , testCase "sendbeat" testSendbeat
             , testCase "recvbeat" testRecvbeat
+            , testCase "beat" testBeat
             , testCase "errors" testErrors
             , testCase "encode" testEncode
             ],
@@ -80,6 +82,17 @@ testSend = do
         Just (Frame (SC RECEIPT) hs _) <- readChan' resp
         let receipt = fromJust $ lookup "receipt-id" hs 
         assertEqual "Receipt for send command" receipt "1")
+    (disconnect con [])
+
+testBatchSend = do
+  initDest dest subid
+  (con, resp, _) <- mkStomp
+  E.finally
+    (do subscribe con dest subid []
+        send' con $ replicate 50 (dest, [], testMsg)
+        forM_ [1..50] $ \_ -> do
+            r <- readChan' resp
+            assertEqual "Invalid message received" (body (fromJust r)) testMsg)
     (disconnect con [])
 
 testSubscribe = do
@@ -223,6 +236,16 @@ testRecvbeat = do
   where   
     isBrokerError (Just (BrokerError _)) = True 
     isBrokerError _ = False
+
+testBeat = do
+  initDest dest subid
+  (con, resp, excp) <- mkStomp
+  E.finally
+    (when (maximum (versions con) > (1,0)) $ do 
+       beat con
+       r <- readChan' resp
+       assertBool "Unexpected response after beat" (isNothing r))
+    (disconnect con [])
 
 testErrors = do
   E.catch 

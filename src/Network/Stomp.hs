@@ -60,6 +60,7 @@ module Network.Stomp (
    stomp',
    disconnect,
    send,
+   send',
    subscribe,
    unsubscribe,
    ack,
@@ -73,11 +74,15 @@ module Network.Stomp (
    setExcpHandler,
    startSendBeat,
    startRecvBeat,
+   beat,
    sendTimeout,
    recvTimeout,
    lastSend,
    lastRecv,
-   versions
+
+   versions,
+   session,
+   server
 )
 where
 
@@ -144,6 +149,8 @@ type Header = (String, String)
 data Connection = Connection {
    handle :: Handle,              
    versions :: [Version], -- ^ accepted stomp versions
+   session :: String, -- ^ session identifier
+   server :: String, -- ^ stomp server info
    listener :: MVar ThreadId, -- ^ frames consumer thread
    sendBeat :: MVar ThreadId, -- ^ send heartbeat thread
    recvBeat :: MVar ThreadId, -- ^ recieve heartbeat thread
@@ -155,7 +162,7 @@ data Connection = Connection {
    closed :: MVar (Maybe StompException), -- ^ closed connection flag
    disconReq :: MVar String, -- ^ disconnect receipt request 
    disconResp :: MVar (), -- ^ disconnect receipt response 
-   excpHandle :: MVar (Maybe (StompException -> IO ())) -- ^ exception handler in the frames consumer
+   excpHandle :: MVar (Maybe (StompException -> IO ())) -- ^ excp handler invoked by the frames consumer
 }
 
 data StompException 
@@ -217,11 +224,18 @@ disconnect con hs = do
    modifyMVar_ (closed con) $ \x -> 
         return (Just $ fromMaybe (ConnectionError "Connection closed") x)
 
-{- send message to the destination. 
-The size of the message should be equal to the value of 'content-length' header. 
--}
+-- | send message to the destination.
+-- | The size of the message should be equal to the value of 'content-length' header. 
 send :: Connection -> Destination -> [Header] -> BL.ByteString -> IO ()
-send con dest hs body = sendFrame con (Frame (CC SEND) hs' body)
+send con dest hs body = sendFrame con $ mkSendFrame (dest, hs, body)
+
+-- | send group of messages to the destination
+send' :: Connection -> [(Destination, [Header], BL.ByteString)] -> IO ()
+send' con xs = sendFrames con $ map mkSendFrame xs
+
+-- | create SEND frame
+mkSendFrame :: (Destination, [Header], BL.ByteString) -> Frame
+mkSendFrame (dest, hs, body) = Frame (CC SEND) hs' body
    where hs' = hs ++ [("destination", dest)] ++ clh
          clh = maybe hdr (\_->[]) $ lookup "content-length" hs
          hdr = [("content-length", show $ BL.length body)]
@@ -272,9 +286,13 @@ mkConnection cmd host port hs = do
     when (cmd /= CONNECTED) $
        E.throwIO $ ConnectionError (BL.unpack body) 
     let (sendBeat, recvBeat) = getBeats hs hs'
-    return con {recvTimeout = recvBeat, sendTimeout = sendBeat, versions = ver hs'} 
-    where ver h = maybe [(1,0)] parseVer $ lookup "version" h
-
+    return con { recvTimeout = recvBeat 
+               , sendTimeout = sendBeat 
+               , versions = maybe [(1,0)] parseVer $ lookup "version" hs'
+               , session = fromMaybe [] $ lookup "session" hs' 
+               , server = fromMaybe [] $ lookup "server" hs'
+               } 
+          
 -- | parse versions supported by the broker 
 parseVer :: String -> [Version]
 parseVer vs 
@@ -309,7 +327,8 @@ newConn host port hs = do
    dRcpt <- newEmptyMVar
    dLock <- newEmptyMVar
    eHndl <- newMVar Nothing   
-   return $ Connection h [] lstnr sBeat rBeat  0 0 lSend lRecv sLock close dRcpt dLock eHndl
+   return $ Connection h [] [] [] lstnr sBeat rBeat  0 0 lSend 
+                  lRecv sLock close dRcpt dLock eHndl
               
 -- | create the authority value
 stompAuth :: String -> Maybe URIAuth
@@ -394,20 +413,26 @@ checkReceipt _ _ = False
 
 -- | send frame buffer to the server
 sendFrame :: Connection -> Frame -> IO ()
-sendFrame con f = sendBuf con (strict $ runPut $ putFrame f)
-   where 
-      putFrame frame@(Frame (CC cmd) hs body) = do
-        mapM_ (putByteString . BU.fromString)
-          [show cmd, "\n", hdrToStr cmd hs, "\n"]
-        unless (BL.null body) $ 
-          putLazyByteString body
-        putWord8 0x00
-      strict x = BS.concat (BL.toChunks x)
+sendFrame con f = sendBuf con (toStrict $ putFrame f) 
 
-{-  unparse frame headers. 
-All frames except the CONNECT and CONNECTED frames will also escape any 
-colon or newline octets
--}
+-- | send batch of frames to the server
+sendFrames :: Connection -> [Frame] -> IO ()
+sendFrames con fs = sendBuf con (toStrict $ mapM_ putFrame fs)
+
+-- | convert buffer to the strict bytestring
+toStrict :: Put -> BS.ByteString
+toStrict = BS.concat . BL.toChunks . runPut
+
+-- | serialize frame 
+putFrame :: Frame -> Put
+putFrame frame@(Frame (CC cmd) hs body) = do
+   mapM_ (putByteString . BU.fromString)
+      [show cmd, "\n", hdrToStr cmd hs, "\n"]
+   unless (BL.null body) $ putLazyByteString body
+   putWord8 0x00
+
+-- | unparse frame headers. 
+-- | All frames except the CONNECT and CONNECTED frames will also escape any colon or newline octets
 hdrToStr :: ClientCommand -> [Header] -> String
 hdrToStr _ [] = []
 hdrToStr CONNECT hs = hdrToStr' id hs
@@ -514,21 +539,19 @@ unesc (x:x':xs)
 
 -------- Heartbeat
 
-{- get heartbeats values from the client and broker headers
-The receiver tolerance is 100%.
--}
+-- | get heartbeats values from the client and broker headers. The receiver tolerance is 100%.
 getBeats :: [Header] -> [Header] -> (Int, Int)
 getBeats xs ys = (getBeat cs sr, 2 * getBeat cr ss)
    where     
    getBeat x y 
       | x /= 0 && y /= 0 = max x y
       | otherwise = 0                 
-   (cs,cr) = beat xs
-   (ss,sr) = beat ys
+   (cs,cr) = mkBeat xs
+   (ss,sr) = mkBeat ys
  
 -- | parse heartbeat
-beat :: [Header] -> (Int,Int)
-beat = maybe (0,0) parseBeat . lookup "heart-beat" 
+mkBeat :: [Header] -> (Int,Int)
+mkBeat = maybe (0,0) parseBeat . lookup "heart-beat" 
   where
     parseBeat = parse . break (==',')
     parse (x,y) = (read x :: Int, read (tail y) :: Int) 
@@ -540,6 +563,10 @@ beatTime v = do
   b <- tryPutMVar v now
   unless b $ modifyMVar_ v $ \_ -> return now
 
+-- | send a single newline byte to the server
+beat :: Connection -> IO ()
+beat con = sendBuf con (BU.fromString "\n\x00")
+
 -- | periodically send heartbeat data to the server 
 clientBeat :: Connection -> IO ()
 clientBeat con = 
@@ -550,7 +577,7 @@ clientBeat con =
       let diff = floor $ diffUTCTime now prev * 1000
       let delay = sendTimeout con
       if diff >= delay then do
-         sendBuf con (BU.fromString "\n\x00")
+         beat con
          threadDelay (1000 * delay)
         else threadDelay (1000 * (delay - diff))  
       clientBeat con)
