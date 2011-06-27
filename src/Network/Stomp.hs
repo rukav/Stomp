@@ -106,6 +106,9 @@ import Control.Concurrent
 import Control.Monad
 import System.IO
 
+---
+import qualified Network.Socket.ByteString.Lazy as L
+
 -- | Stomp frame record
 data Frame = Frame {
    command :: Command, 
@@ -205,7 +208,7 @@ connect' h p vs hs = mkConnection CONNECT h p hs'
          vers = intercalate "," $ map go vs
          go (v,v') = show v ++ '.':show v'
 
--- | connect to the stomp 1.0 broker using hostname and port
+-- | connect to the stomp 1.1 broker using hostname and port
 stomp' ::  Host -> PortNumber -> [Header] -> IO Connection
 stomp' = mkConnection STOMP
 
@@ -225,11 +228,12 @@ disconnect con hs = do
         return (Just $ fromMaybe (ConnectionError "Connection closed") x)
 
 -- | send message to the destination.
--- | The size of the message should be equal to the value of 'content-length' header. 
+-- | The header 'content-length' is automatically set by this module. 
 send :: Connection -> Destination -> [Header] -> BL.ByteString -> IO ()
 send con dest hs body = sendFrame con $ mkSendFrame (dest, hs, body)
 
--- | send group of messages to the destination
+-- | send group of messages to the destination.
+-- | The header 'content-length' is automatically set by this module. 
 send' :: Connection -> [(Destination, [Header], BL.ByteString)] -> IO ()
 send' con xs = sendFrames con $ map mkSendFrame xs
 
@@ -413,15 +417,11 @@ checkReceipt _ _ = False
 
 -- | send frame buffer to the server
 sendFrame :: Connection -> Frame -> IO ()
-sendFrame con f = sendBuf con (toStrict $ putFrame f) 
+sendFrame con f = sendBuf con (runPut $ putFrame f) 
 
 -- | send batch of frames to the server
 sendFrames :: Connection -> [Frame] -> IO ()
-sendFrames con fs = sendBuf con (toStrict $ mapM_ putFrame fs)
-
--- | convert buffer to the strict bytestring
-toStrict :: Put -> BS.ByteString
-toStrict = BS.concat . BL.toChunks . runPut
+sendFrames con fs = sendBuf con (runPut $ mapM_ putFrame fs)
 
 -- | serialize frame 
 putFrame :: Frame -> Put
@@ -442,17 +442,21 @@ hdrToStr' f xs = unlines $ map go xs
   where go (x,y) = f x ++ ":" ++ f y 
 
 -- | send buffer to the handle
-sendBuf :: Connection -> BS.ByteString -> IO ()
+sendBuf :: Connection -> BL.ByteString -> IO ()
 sendBuf con bs = 
   withMVar (closed con) $ \c ->
       if isJust c then E.throwIO (fromJust c)
        else
          E.catch
            (withMVar (sockLock con) $ \_ -> do
-               BS.hPut (handle con) bs
-               hFlush (handle con)
+               sendBuf' con bs
                beatTime (lastSend con))
            (\(e :: E.IOException) -> E.throwIO $ StompIOError e)
+  where 
+    sendBuf' c str = do
+      BS.hPut (handle con) (toStrict str)
+      hFlush (handle con)
+    toStrict = BS.concat . BL.toChunks
 
 --------- Receive frame
 
@@ -514,10 +518,7 @@ readBody con hs = maybe (readTill h) (readBuf h) len
        ch <- BL.hGet h 1
        if ch == term then return B.empty 
         else liftM (B.append $ B.fromLazyByteString ch) (readTill' h)
-
--- | stomp frame terminator
-term :: BL.ByteString
-term = BL.pack "\x00"
+    term = BL.singleton '\x00'
 
 -------- Escaping
 
@@ -565,7 +566,7 @@ beatTime v = do
 
 -- | send a single newline byte to the server
 beat :: Connection -> IO ()
-beat con = sendBuf con (BU.fromString "\n\x00")
+beat con = sendBuf con (BL.fromChunks [BU.fromString "\n\x00"])
 
 -- | periodically send heartbeat data to the server 
 clientBeat :: Connection -> IO ()
@@ -619,4 +620,3 @@ startRecvBeat c = do
                (tryPutMVar (disconResp c) ())
       tryPutMVar (recvBeat c) tid
       return ()
-   
