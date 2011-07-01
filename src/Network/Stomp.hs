@@ -393,8 +393,7 @@ startConsumer c fun = do
        tid <- forkIO $ E.finally 
                (consumeFrames c fun)
                (tryPutMVar (disconResp c) ())
-       tryPutMVar (listener c) tid
-       return ()
+       void $ tryPutMVar (listener c) tid
 
 -- | For any incoming frame the user callback will be invoked
 consumeFrames :: Connection -> (Frame -> IO ()) -> IO ()
@@ -417,19 +416,21 @@ checkReceipt _ _ = False
 
 -- | send frame buffer to the server
 sendFrame :: Connection -> Frame -> IO ()
-sendFrame con f = sendBuf con (runPut $ putFrame f) 
+sendFrame con f = sendBuf con (putFrames [f]) 
 
 -- | send batch of frames to the server
 sendFrames :: Connection -> [Frame] -> IO ()
-sendFrames con fs = sendBuf con (runPut $ mapM_ putFrame fs)
+sendFrames con fs = sendBuf con (putFrames fs)
 
--- | serialize frame 
-putFrame :: Frame -> Put
-putFrame frame@(Frame (CC cmd) hs body) = do
-   mapM_ (putByteString . BU.fromString)
-      [show cmd, "\n", hdrToStr cmd hs, "\n"]
-   unless (BL.null body) $ putLazyByteString body
-   putWord8 0x00
+-- | serialize frames
+putFrames :: [Frame] -> BL.ByteString
+putFrames fs = runPut $ mapM_ put fs
+   where 
+   put (Frame (CC cmd) hs body) = do
+      mapM_ (putByteString . BU.fromString)
+         [show cmd, "\n", hdrToStr cmd hs, "\n"]
+      unless (BL.null body) $ putLazyByteString body
+      putWord8 0x00
 
 -- | unparse frame headers. 
 -- | All frames except the CONNECT and CONNECTED frames will also escape any colon or newline octets
@@ -449,50 +450,41 @@ sendBuf con bs =
        else
          E.catch
            (withMVar (sockLock con) $ \_ -> do
-               sendBuf' con bs
+               BS.hPut (handle con) (BS.concat $ BL.toChunks bs)
+               hFlush (handle con)
                beatTime (lastSend con))
            (\(e :: E.IOException) -> E.throwIO $ StompIOError e)
-  where 
-    sendBuf' c str = do
-      BS.hPut (handle con) (toStrict str)
-      hFlush (handle con)
-    toStrict = BS.concat . BL.toChunks
 
 --------- Receive frame
 
--- | reads incoming frame from handle
+-- | receives incoming frame
 receiveFrame :: Connection -> IO Frame
 receiveFrame con = do
-   cmd <- readCommand con
-   headers <- readHeaders con cmd
-   body <- readBody con headers
-   beatTime (lastRecv con)
-   return (Frame cmd headers body)
-
--- | read line from handle
-readLine :: Handle -> IO String
-readLine h = fmap BU.toString (BS.hGetLine h)
-
--- | read stomp command or broker heartbeat from handle
-readCommand :: Connection -> IO Command
-readCommand con = do
    eof <- hIsEOF (handle con)
-   if eof then 
-       E.throwIO $ ConnectionError "Connection closed by broker"
+   if eof then
+      E.throwIO $ ConnectionError "Connection closed by broker"
     else do
-       l <- readLine (handle con)
-       let l' = dropWhile (=='\x00') l 
-       if null l' then do  -- broker heartbeat
-           beatTime (lastRecv con)
-           readCommand con
-        else return $ SC (read l' :: ServerCommand)
+       frame <- getFrame (handle con)
+       beatTime (lastRecv con)
+       maybe (receiveFrame con) return frame
 
--- | read stomp headers from handle                
-readHeaders :: Connection -> Command -> IO [Header]
-readHeaders con cmd = do
-   l <- readLine (handle con)
+-- | reads frame from the handle
+getFrame :: Handle -> IO (Maybe Frame)
+getFrame h = do
+   line <- liftM (dropWhile (=='\x00')) (readLine h) 
+   if null line then return Nothing
+     else do
+       let cmd = SC (read line :: ServerCommand)
+       headers <- readHeaders h cmd
+       body <- readBody h headers
+       return (Just $ Frame cmd headers body)
+
+-- | reads stomp headers
+readHeaders :: Handle -> Command -> IO [Header]
+readHeaders h cmd = do
+   l <- readLine h
    if null l then return []
-     else do hs <- readHeaders con cmd
+     else do hs <- readHeaders h cmd
              return (header (unesc l):hs)
              case cmd of
                (SC CONNECTED) -> return (header l:hs)
@@ -501,11 +493,10 @@ readHeaders con cmd = do
      header x = let (name, val) = break (==':') x
                 in (name, tail val)
 
--- read stomp message with length 'content-length' or until frame terminator
-readBody :: Connection -> [Header] -> IO BL.ByteString
-readBody con hs = maybe (readTill h) (readBuf h) len
+-- reads stomp message with length 'content-length' or until frame terminator
+readBody :: Handle -> [Header] -> IO BL.ByteString
+readBody h hs = maybe (readTill h) (readBuf h) len
    where 
-    h = handle con
     len = lookup "content-length" hs
     readBuf h x = do
        bs <- BL.hGet h (read x :: Int)
@@ -519,6 +510,10 @@ readBody con hs = maybe (readTill h) (readBuf h) len
        if ch == term then return B.empty 
         else liftM (B.append $ B.fromLazyByteString ch) (readTill' h)
     term = BL.singleton '\x00'
+
+-- | read line from handle
+readLine :: Handle -> IO String
+readLine h = fmap BU.toString (BS.hGetLine h)
 
 -------- Escaping
 
@@ -607,8 +602,7 @@ startSendBeat c = do
       tid <- forkIO $ E.finally
                (clientBeat c)
                (tryPutMVar (disconResp c) ())
-      tryPutMVar (sendBeat c) tid
-      return ()
+      void $ tryPutMVar (sendBeat c) tid
 
 -- | fork receive heartbeat thread
 startRecvBeat :: Connection -> IO ()
@@ -618,5 +612,5 @@ startRecvBeat c = do
       tid <- forkIO $ E.finally
                (brokerBeat c)
                (tryPutMVar (disconResp c) ())
-      tryPutMVar (recvBeat c) tid
-      return ()
+      void $ tryPutMVar (recvBeat c) tid
+
