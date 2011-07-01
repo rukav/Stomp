@@ -11,10 +11,15 @@ Bug-Reports:         mailto:virukav@gmail.com
 Build-Type:          Simple
 Category:            Network
 Synopsis:            Client library for Stomp brokers.
-Cabal-Version:       >=1.2
+Cabal-Version:       >=1.6
 Extra-Source-Files:  README
                      test/Tests.hs
                      examples/Example.hs
+
+Source-Repository head
+  Type:              git
+  Location:          http://github.com/rukav/Stomp
+
 Library
   Hs-Source-Dirs:    src
   Exposed-Modules:   Network.Stomp
